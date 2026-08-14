@@ -1,0 +1,2 @@
+name: Hermes 记忆闭环
+description: 基于 code 基底（Code Mode），加入跨会话记忆（memory + 实时 prompt 注入）、自主学习 skill（skill_manage）、原生跨会话搜索（session_search 系列）。

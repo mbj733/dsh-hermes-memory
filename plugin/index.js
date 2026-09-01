@@ -6,15 +6,17 @@
 // launch directories — fully decoupled from the sandbox workspace.
 //
 // This file is referenced by absolute path from a user agent preset. It is
-// hand-written ESM (no TypeScript build) and imports schemastery through a
-// relative path to the vendored source so it needs no `pnpm install`.
+// hand-written ESM (no TypeScript build). Fully self-contained: the vendored
+// schemastery (with its own node_modules) lives in this repository at
+// ../vendor/schemastery, so the plugin can sit anywhere on disk and survives
+// DeepSeek Harness version updates (no coupling to the harness checkout).
 
-import z from '../../../../vendor/schemastery/lib/index.mjs'
+import z from '../vendor/schemastery/lib/index.mjs'
 
 export const name = 'hermes'
 export const inject = ['tools', 'systemPrompt']
 
-const MEMORY_LIMIT = 2200 // ~800 tokens — agent's personal notes
+const MEMORY_LIMIT = 4000 // ~1500 tokens — agent's personal notes
 const USER_LIMIT = 1375 // ~500 tokens — user profile
 const NAME_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/
 

@@ -31,7 +31,6 @@ const schema = z.object({
 })
 
 export function apply(ctx, config) {
-  const settings = ctx.get('settings')
   const skills = ctx.get('skills')
 
   // Live view. Falls back to in-memory when the settings service is absent.
@@ -39,31 +38,72 @@ export function apply(ctx, config) {
   const live = { memory: [], user: [], skills: [] }
   const disposers = new Map()
 
-  if (settings !== undefined) {
-    try {
-      scope = settings.register('hermes-memory', schema, { base: { memory: [], user: [], skills: [] } })
-      const resolved = scope.get()
-      if (Array.isArray(resolved.memory)) live.memory = resolved.memory.filter((x) => typeof x === 'string')
-      if (Array.isArray(resolved.user)) live.user = resolved.user.filter((x) => typeof x === 'string')
-      if (Array.isArray(resolved.skills)) {
-        for (const s of resolved.skills) {
-          if (s && typeof s.name === 'string' && NAME_RE.test(s.name) && typeof s.content === 'string') {
-            live.skills.push({ name: s.name, description: typeof s.description === 'string' ? s.description : '', content: s.content })
-          }
+  // The settings service starts asynchronously, and loader entries apply in
+  // parallel: this plugin's apply can run before the root provider finishes
+  // its first load, so a one-shot `ctx.get('settings')` here races and may
+  // cache `undefined` forever. Resolve the scope lazily on every tool action
+  // instead, and absorb the persisted document in place so captured array
+  // references stay valid.
+  function absorbResolved(resolved) {
+    if (!resolved || typeof resolved !== 'object') return
+    if (Array.isArray(resolved.memory)) {
+      live.memory.length = 0
+      for (const x of resolved.memory) if (typeof x === 'string') live.memory.push(x)
+    }
+    if (Array.isArray(resolved.user)) {
+      live.user.length = 0
+      for (const x of resolved.user) if (typeof x === 'string') live.user.push(x)
+    }
+    if (Array.isArray(resolved.skills)) {
+      live.skills.length = 0
+      for (const s of resolved.skills) {
+        if (s && typeof s.name === 'string' && NAME_RE.test(s.name) && typeof s.content === 'string') {
+          live.skills.push({ name: s.name, description: typeof s.description === 'string' ? s.description : '', content: s.content })
         }
       }
+    }
+  }
+
+  function mountScope(s) {
+    scope = s.register('hermes-memory', schema, { base: { memory: [], user: [], skills: [] } })
+    absorbResolved(scope.get())
+    for (const entry of live.skills) registerSkill(entry)
+  }
+
+  function ensureScope() {
+    if (scope !== undefined) return scope
+    let s
+    try {
+      s = ctx.get('settings')
+    } catch (error) {
+      return undefined
+    }
+    if (s === undefined) return undefined
+    try {
+      mountScope(s)
+    } catch (error) {
+      scope = undefined
+      return undefined
+    }
+    return scope
+  }
+
+  const settings = ctx.get('settings')
+  if (settings !== undefined) {
+    try {
+      mountScope(settings)
     } catch (error) {
       scope = undefined
     }
   }
 
   async function persistMemory(memory, user) {
-    if (scope === undefined) throw new Error('settings service unavailable; memory is not persisted')
+    if (ensureScope() === undefined) throw new Error('settings service unavailable; memory is not persisted')
     await scope.update({ memory, user })
   }
 
   async function persistSkills(skillsArr) {
-    if (scope === undefined) throw new Error('settings service unavailable; skills are not persisted')
+    if (ensureScope() === undefined) throw new Error('settings service unavailable; skills are not persisted')
     await scope.update({ skills: skillsArr.map((s) => ({ name: s.name, description: s.description, content: s.content })) })
   }
 
@@ -119,6 +159,7 @@ export function apply(ctx, config) {
     execute: async (args) => {
       const action = args.action || 'list'
       const target = args.target === 'user' ? 'user' : 'memory'
+      ensureScope()
       const list = target === 'user' ? live.user : live.memory
       const limit = target === 'user' ? USER_LIMIT : MEMORY_LIMIT
       const joined = () => list.join('\n')

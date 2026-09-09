@@ -16,8 +16,8 @@ import z from '../vendor/schemastery/lib/index.mjs'
 export const name = 'hermes'
 export const inject = ['tools', 'systemPrompt']
 
-const MEMORY_LIMIT = 4000 // ~1500 tokens — agent's personal notes
-const USER_LIMIT = 1375 // ~500 tokens — user profile
+const DEFAULT_MEMORY_LIMIT_BYTES = 8000 // agent's personal notes, UTF-8 bytes
+const DEFAULT_USER_LIMIT_BYTES = 4000 // user profile, UTF-8 bytes
 const NAME_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/
 
 const schema = z.object({
@@ -30,8 +30,17 @@ const schema = z.object({
   })),
 })
 
+/** Plugin config: UTF-8 byte caps for the two memory targets (loader-validated). */
+export const Config = z.object({
+  memoryLimitBytes: z.natural().default(DEFAULT_MEMORY_LIMIT_BYTES),
+  userLimitBytes: z.natural().default(DEFAULT_USER_LIMIT_BYTES),
+})
+
 export function apply(ctx, config) {
   const skills = ctx.get('skills')
+  const memoryLimitBytes = config?.memoryLimitBytes ?? DEFAULT_MEMORY_LIMIT_BYTES
+  const userLimitBytes = config?.userLimitBytes ?? DEFAULT_USER_LIMIT_BYTES
+  const sizeOf = (value) => new TextEncoder().encode(value).length
 
   // Live view. Falls back to in-memory when the settings service is absent.
   let scope
@@ -130,7 +139,13 @@ export function apply(ctx, config) {
       const mem = live.memory.filter(Boolean)
       const user = live.user.filter(Boolean)
       const parts = []
-      parts.push('AUTOMATIC MEMORY (always on): you maintain this memory yourself, proactively — never wait to be asked. After each turn, if the user expressed a preference, revealed a working style, corrected you, or stated a convention, save it now with the `memory` tool. After finishing a task together, summarize the preferences you observed into compact entries. Prefer target `user` for preferences/communication style; target `memory` for environment/project facts and learned techniques. Forgetting costs repeated corrections; saving is cheap and permanent.')
+      parts.push([
+        'AUTOMATIC MEMORY (always on) — you maintain this memory yourself, but with a gate:',
+        '1. Save without asking: environment facts, tool/path facts, and corrections that would otherwise cost repeated work — one compact line each.',
+        '2. Ask first (one short question): user preferences, working-style agreements, naming or convention decisions — anything that binds future behavior. The `memory` tool rejects `target: user` writes unless you pass `confirmed: true`, so ask before you call it.',
+        '3. Never save: entertainment or life trivia, one-off ephemera, raw data dumps, or anything already covered by a skill or re-discoverable from files. Distil reusable procedure into `skill_manage` instead.',
+        'Targets: `user` = preferences/communication style; `memory` = environment/project facts and learned techniques.',
+      ].join('\n'))
       if (mem.length > 0) {
         parts.push('════════════ MEMORY (your personal notes) ════════════\n' + mem.join('\n§\n'))
       }
@@ -144,7 +159,7 @@ export function apply(ctx, config) {
 
   ctx.effect(() => ctx.tools.register({
     name: 'memory',
-    description: 'Persistent cross-session memory (agent notes + user profile), injected into your prompt every session. Call this proactively whenever you observe a preference or finish a task — do not wait to be asked. Actions: list, add, replace, remove. Store compact, information-dense facts only — user preferences, environment facts, project conventions, corrections, completed work. Skip trivia, re-discoverable facts, raw data dumps, and one-off ephemera.',
+    description: 'Persistent cross-session memory (agent notes + user profile), injected into your prompt every session. Save environment/tool facts and corrections directly; ASK the user first before persisting preferences or working-style agreements (target: user requires confirmed: true). Actions: list, add, replace, remove. Store compact, information-dense facts only — one line per fact. Skip trivia, re-discoverable facts, raw data dumps, and one-off ephemera.',
     parameters: {
       type: 'object',
       properties: {
@@ -152,6 +167,7 @@ export function apply(ctx, config) {
         target: { type: 'string', description: 'memory (agent notes) or user (user profile); defaults to memory' },
         content: { type: 'string', description: 'new entry text (add / replace)' },
         old_text: { type: 'string', description: 'unique substring identifying one existing entry (replace / remove)' },
+        confirmed: { type: 'boolean', description: 'set true only after the user agreed to persist a preference/agreement; required for target: user writes' },
       },
       additionalProperties: false,
     },
@@ -159,11 +175,16 @@ export function apply(ctx, config) {
     execute: async (args) => {
       const action = args.action || 'list'
       const target = args.target === 'user' ? 'user' : 'memory'
+      // Rule: preferences/agreements bind future behavior, so the agent must ask
+      // the user first. Enforced here, not just suggested in the prompt.
+      if (target === 'user' && action !== 'list' && args.confirmed !== true) {
+        return JSON.stringify({ success: false, error: 'user-profile writes change future behavior: ask the user first, then retry with confirmed: true' })
+      }
       ensureScope()
       const list = target === 'user' ? live.user : live.memory
-      const limit = target === 'user' ? USER_LIMIT : MEMORY_LIMIT
+      const limit = target === 'user' ? userLimitBytes : memoryLimitBytes
       const joined = () => list.join('\n')
-      const usage = () => joined().length + '/' + limit
+      const usage = () => sizeOf(joined()) + '/' + limit
 
       if (action === 'list') {
         return JSON.stringify({ success: true, target, entries: list.slice(), usage: usage() })
@@ -173,8 +194,8 @@ export function apply(ctx, config) {
         const content = typeof args.content === 'string' ? args.content.trim() : ''
         if (content === '') return JSON.stringify({ success: false, error: 'content is required for add' })
         if (list.indexOf(content) !== -1) return JSON.stringify({ success: true, note: 'no duplicate added' })
-        if (joined().length + content.length > limit) {
-          return JSON.stringify({ success: false, error: 'memory at ' + joined().length + '/' + limit + ' chars; adding would exceed the limit. Consolidate with replace/remove first, then retry add.', current_entries: list.slice(), usage: usage() })
+        if (sizeOf(joined()) + sizeOf(content) > limit) {
+          return JSON.stringify({ success: false, error: 'memory at ' + sizeOf(joined()) + '/' + limit + ' bytes; adding would exceed the limit. Consolidate with replace/remove first, then retry add.', current_entries: list.slice(), usage: usage() })
         }
         const next = list.slice()
         next.push(content)
@@ -208,8 +229,8 @@ export function apply(ctx, config) {
         if (content === '') return JSON.stringify({ success: false, error: 'content is required for replace' })
         const after = list.slice()
         after[idx] = content
-        if (after.join('\n').length > limit) {
-          return JSON.stringify({ success: false, error: 'replacement would exceed the ' + limit + '-char limit; shorten content or remove another entry', current_entries: list.slice(), usage: usage() })
+        if (sizeOf(after.join('\n')) > limit) {
+          return JSON.stringify({ success: false, error: 'replacement would exceed the ' + limit + '-byte limit; shorten content or remove another entry', current_entries: list.slice(), usage: usage() })
         }
         const before = list[idx]
         const next = list.slice()
@@ -270,7 +291,8 @@ export function apply(ctx, config) {
         if (entry === undefined) return JSON.stringify({ success: false, error: 'no skill "' + name + '"' })
         if (oldStr === '') return JSON.stringify({ success: false, error: 'old_string is required for patch' })
         if (entry.content.indexOf(oldStr) === -1) return JSON.stringify({ success: false, error: 'old_string not found in skill "' + name + '"' })
-        const newContent = entry.content.replace(oldStr, content)
+        // Function replacement: a string replacement would expand $ patterns in content.
+        const newContent = entry.content.replace(oldStr, () => content)
         const next = live.skills.map((s) => s === entry ? { name: s.name, description: s.description, content: newContent } : s)
         try { await persistSkills(next) } catch (e) { return JSON.stringify({ success: false, error: 'persist failed: ' + String(e && e.message ? e.message : e) }) }
         entry.content = newContent
